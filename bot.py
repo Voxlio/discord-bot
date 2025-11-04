@@ -24,7 +24,9 @@ except Exception:
 # -------------------------
 # 🔑 Tokens & Logo
 # -------------------------
-TOKEN = "MTQxMjg5MzU1NzI2OTcyNTMxNQ.GZJbok.b2aYEGrnk_hiAWyr5Nkd66GSRBm05Jg4RL0wm4"
+import os
+bot.run(os.getenv("TOKEN"))
+TOKEN = ""
 LOGO_URL = "https://cdn.discordapp.com/attachments/993192595796787200/1413250033545121802/vox_logo.png"
 
 # -------------------------
