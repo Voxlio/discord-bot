@@ -1,3 +1,19 @@
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "discord-bot is running!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
 import os
 import re
 import random
@@ -963,7 +979,8 @@ async def reset_raffles(ctx):
     already_picked.clear()
 
     await ctx.send("✅ Raffles and stats have been reset. Registered users remain.")
-
+keep_alive()
+bot.run(TOKEN)
 # -------------------------
 # ▶️ Run Bot
 # -------------------------
