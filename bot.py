@@ -63,7 +63,6 @@ DB_ENGINE = create_engine(
     DATABASE_URL,
     # Use StaticPool for non-asyncio database connections in an async environment
     poolclass=StaticPool, 
-    connect_args={"check_same_thread": False} 
 )
 
 # REMOVED: def db_conn(): return sqlite3.connect(DB_PATH)
