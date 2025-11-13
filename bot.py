@@ -1,23 +1,7 @@
-from flask import Flask
-from threading import Thread
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "discord-bot is running!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
 import os
 import re
 import random
-import sqlite3
+# import sqlite3  <-- REMOVED
 import asyncio
 from datetime import datetime, timedelta
 import discord
@@ -30,6 +14,11 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet
 
+# --- NEW IMPORTS FOR POSTGRESQL/SQLALCHEMY ---
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import StaticPool
+# ---------------------------------------------
+
 # Optional PNG export (pure-Pillow)
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -40,9 +29,8 @@ except Exception:
 # -------------------------
 # 🔑 Tokens & Logo
 # -------------------------
-import os
-bot.run(os.getenv("TOKEN"))
-TOKEN = ""
+# 🚨 SECURITY FIX: Using environment variable for token
+TOKEN = os.getenv('DISCORD_TOKEN')
 LOGO_URL = "https://cdn.discordapp.com/attachments/993192595796787200/1413250033545121802/vox_logo.png"
 
 # -------------------------
@@ -64,199 +52,209 @@ already_picked = set()
 always_pick = set()
 WINNER_ROLE_NAME = "Winner"
 
-DB_PATH = "voxpicker.db"
+# REMOVED: DB_PATH = "voxpicker.db"
 
-# -------------------------
-# 🗃️ Database helpers
-# -------------------------
-def db_conn():
-    return sqlite3.connect(DB_PATH)
+# ---------------------------------------------
+# 🗃️ Database helpers (PostgreSQL Engine)
+# ---------------------------------------------
+# Load the database URL from the environment variable (set on Render)
+DATABASE_URL = os.getenv('DATABASE_URL')
+DB_ENGINE = create_engine(
+    DATABASE_URL,
+    # Use StaticPool for non-asyncio database connections in an async environment
+    poolclass=StaticPool, 
+    connect_args={"check_same_thread": False} 
+)
+
+# REMOVED: def db_conn(): return sqlite3.connect(DB_PATH)
 
 def db_init():
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("""
+    # Use DB_ENGINE.begin() for transactional operations (CREATE TABLE)
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             x_link TEXT
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS stats(
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             registrations INTEGER DEFAULT 0,
             wins INTEGER DEFAULT 0,
             FOREIGN KEY(user_id) REFERENCES users(user_id)
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS always_pick(
-            user_id INTEGER PRIMARY KEY
+            user_id BIGINT PRIMARY KEY
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS raffles(
             raffle_name TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             archived INTEGER DEFAULT 0,
             PRIMARY KEY(raffle_name)
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS raffle_winners(
             raffle_name TEXT,
-            user_id INTEGER,
-            picked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            user_id BIGINT,
+            picked_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(raffle_name, user_id),
             FOREIGN KEY(raffle_name) REFERENCES raffles(raffle_name)
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS picks_state(
-            user_id INTEGER PRIMARY KEY
+            user_id BIGINT PRIMARY KEY
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS archive_schedule(
             raffle_name TEXT PRIMARY KEY,
-            archive_at TEXT
+            archive_at TIMESTAMP WITHOUT TIME ZONE
         );
-        """)
-        cur.execute("""
+        """))
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS blacklist(
-            user_id INTEGER PRIMARY KEY
-        )""")
-        con.commit()
+            user_id BIGINT PRIMARY KEY
+        )"""))
+        # COMMIT is handled automatically by the .begin() context manager
 
 def load_state_from_db():
-    with db_conn() as con:
-        cur = con.cursor()
-        for uid, link in cur.execute("SELECT user_id, x_link FROM users"):
+    # Use DB_ENGINE.connect() for read-only operations
+    with DB_ENGINE.connect() as conn:
+        # Fetch data and populate global dictionaries/sets
+        for uid, link in conn.execute(text("SELECT user_id, x_link FROM users")).fetchall():
             user_links[uid] = link or ""
-        for uid, reg, wins in cur.execute("SELECT user_id, registrations, wins FROM stats"):
+        
+        for uid, reg, wins in conn.execute(text("SELECT user_id, registrations, wins FROM stats")).fetchall():
             user_stats[uid] = {"registrations": reg or 0, "wins": wins or 0}
+        
         always_pick.clear()
-        for (uid,) in cur.execute("SELECT user_id FROM always_pick"):
+        for (uid,) in conn.execute(text("SELECT user_id FROM always_pick")).fetchall():
             always_pick.add(uid)
+            
         raffles.clear()
-        for (name,) in cur.execute("SELECT raffle_name FROM raffles WHERE archived = 0"):
+        for (name,) in conn.execute(text("SELECT raffle_name FROM raffles WHERE archived = 0")).fetchall():
             raffles[name] = []
-        for name, uid in cur.execute("""
+            
+        for name, uid in conn.execute(text("""
             SELECT raffle_name, user_id FROM raffle_winners
             JOIN raffles USING(raffle_name)
             WHERE raffles.archived = 0
-        """):
+        """)).fetchall():
             raffles.setdefault(name, []).append(uid)
+            
         already_picked.clear()
-        for (uid,) in cur.execute("SELECT user_id FROM picks_state"):
+        for (uid,) in conn.execute(text("SELECT user_id FROM picks_state")).fetchall():
             already_picked.add(uid)
 
 def db_upsert_user(user_id: int, link: str):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT INTO users(user_id, x_link) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET x_link=excluded.x_link", (user_id, link))
-        cur.execute("INSERT INTO stats(user_id, registrations, wins) VALUES(?, 0, 0) ON CONFLICT(user_id) DO NOTHING", (user_id,))
-        con.commit()
+    # Use DB_ENGINE.begin() for transactional operations (INSERT/UPDATE)
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO users(user_id, x_link) VALUES(:user_id, :link)
+        ON CONFLICT(user_id) DO UPDATE SET x_link=EXCLUDED.x_link
+        """), {"user_id": user_id, "link": link})
+        
+        conn.execute(text("""
+        INSERT INTO stats(user_id, registrations, wins) VALUES(:user_id, 0, 0) 
+        ON CONFLICT(user_id) DO NOTHING
+        """), {"user_id": user_id})
 
 def db_update_stat(user_id: int, delta_reg: int = 0, delta_wins: int = 0):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("""
-        INSERT INTO stats(user_id, registrations, wins) VALUES(?, ?, ?)
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO stats(user_id, registrations, wins) VALUES(:user_id, :reg_val, :wins_val)
         ON CONFLICT(user_id) DO UPDATE SET
-            registrations = registrations + ?,
-            wins = wins + ?
-        """, (user_id, max(delta_reg,0), max(delta_wins,0), delta_reg, delta_wins))
-        con.commit()
+            registrations = stats.registrations + :delta_reg,
+            wins = stats.wins + :delta_wins
+        """), {
+            "user_id": user_id, 
+            "reg_val": max(delta_reg, 0), # Values for initial INSERT
+            "wins_val": max(delta_wins, 0),
+            "delta_reg": delta_reg,      # Values for UPDATE
+            "delta_wins": delta_wins
+        })
 
 def db_set_always(user_id: int, add=True):
-    with db_conn() as con:
-        cur = con.cursor()
+    with DB_ENGINE.begin() as conn:
         if add:
-            cur.execute("INSERT OR IGNORE INTO always_pick(user_id) VALUES(?)", (user_id,))
+            conn.execute(text("INSERT INTO always_pick(user_id) VALUES(:user_id) ON CONFLICT DO NOTHING"), {"user_id": user_id})
         else:
-            cur.execute("DELETE FROM always_pick WHERE user_id=?", (user_id,))
-        con.commit()
+            conn.execute(text("DELETE FROM always_pick WHERE user_id=:user_id"), {"user_id": user_id})
 
 def db_set_picked(user_id: int, add=True):
-    with db_conn() as con:
-        cur = con.cursor()
+    with DB_ENGINE.begin() as conn:
         if add:
-            cur.execute("INSERT OR IGNORE INTO picks_state(user_id) VALUES(?)", (user_id,))
+            conn.execute(text("INSERT INTO picks_state(user_id) VALUES(:user_id) ON CONFLICT DO NOTHING"), {"user_id": user_id})
         else:
-            cur.execute("DELETE FROM picks_state WHERE user_id=?", (user_id,))
-        con.commit()
+            conn.execute(text("DELETE FROM picks_state WHERE user_id=:user_id"), {"user_id": user_id})
 
 def db_reset_picks(clear_all=True):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM picks_state")
-        con.commit()
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM picks_state"))
 
 def db_create_raffle(raffle_name: str):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO raffles(raffle_name, archived) VALUES(?, 0)", (raffle_name,))
-        con.commit()
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("INSERT INTO raffles(raffle_name, archived) VALUES(:name, 0) ON CONFLICT DO NOTHING"), {"name": raffle_name})
 
 def db_add_winner(raffle_name: str, user_id: int):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO raffle_winners(raffle_name, user_id, picked_at) VALUES(?, ?, ?)",
-                    (raffle_name, user_id, datetime.utcnow().isoformat()))
-        con.commit()
+    # PostgreSQL uses NOW() or CURRENT_TIMESTAMP for ISO format is best handled by DB
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("""
+        INSERT INTO raffle_winners(raffle_name, user_id, picked_at) 
+        VALUES(:name, :user_id, NOW()) 
+        ON CONFLICT DO NOTHING
+        """), {"name": raffle_name, "user_id": user_id})
 
 def db_archive_raffle(raffle_name: str):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("UPDATE raffles SET archived = 1 WHERE raffle_name = ?", (raffle_name,))
-        cur.execute("DELETE FROM archive_schedule WHERE raffle_name=?", (raffle_name,))
-        con.commit()
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("UPDATE raffles SET archived = 1 WHERE raffle_name = :name"), {"name": raffle_name})
+        conn.execute(text("DELETE FROM archive_schedule WHERE raffle_name=:name"), {"name": raffle_name})
 
 def db_is_archived(raffle_name: str) -> bool:
-    with db_conn() as con:
-        cur = con.cursor()
-        row = cur.execute("SELECT archived FROM raffles WHERE raffle_name=?", (raffle_name,)).fetchone()
+    with DB_ENGINE.connect() as conn:
+        row = conn.execute(text("SELECT archived FROM raffles WHERE raffle_name=:name"), {"name": raffle_name}).fetchone()
         return bool(row and row[0] == 1)
 
 def db_get_active_raffles():
-    with db_conn() as con:
-        cur = con.cursor()
-        return [r[0] for r in cur.execute("SELECT raffle_name FROM raffles WHERE archived = 0")]
+    with DB_ENGINE.connect() as conn:
+        return [r[0] for r in conn.execute(text("SELECT raffle_name FROM raffles WHERE archived = 0")).fetchall()]
 
 def db_get_archived_raffles():
-    with db_conn() as con:
-        cur = con.cursor()
-        return [r[0] for r in cur.execute("SELECT raffle_name FROM raffles WHERE archived = 1")]
+    with DB_ENGINE.connect() as conn:
+        return [r[0] for r in conn.execute(text("SELECT raffle_name FROM raffles WHERE archived = 1")).fetchall()]
 
 def db_schedule_archive(raffle_name: str, when: datetime):
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR REPLACE INTO archive_schedule(raffle_name, archive_at) VALUES(?, ?)",
-                    (raffle_name, when.isoformat()))
-        con.commit()
+    # Ensure datetime object is in UTC ISO format for DB storage
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("INSERT INTO archive_schedule(raffle_name, archive_at) VALUES(:name, :when) ON CONFLICT (raffle_name) DO UPDATE SET archive_at = EXCLUDED.archive_at"),
+                    {"name": raffle_name, "when": when.isoformat()})
 
 def db_get_due_archives(now: datetime):
-    with db_conn() as con:
-        cur = con.cursor()
-        return [r[0] for r in cur.execute("SELECT raffle_name FROM archive_schedule WHERE archive_at <= ?", (now.isoformat(),))]
+    # Query uses the ISO formatted string for comparison
+    with DB_ENGINE.connect() as conn:
+        return [r[0] for r in conn.execute(text("SELECT raffle_name FROM archive_schedule WHERE archive_at <= :now"), {"now": now.isoformat()}).fetchall()]
 
 def db_user_wins(user_id: int):
-    with db_conn() as con:
-        cur = con.cursor()
-        return [row[0] for row in cur.execute("""
+    with DB_ENGINE.connect() as conn:
+        return [row[0] for row in conn.execute(text("""
             SELECT raffle_name FROM raffle_winners
             JOIN raffles USING(raffle_name)
-            WHERE user_id=?""", (user_id,))]
+            WHERE user_id=:user_id"""), {"user_id": user_id}).fetchall()]
 
 def is_blacklisted(user_id: int) -> bool:
-    with db_conn() as con:
-        cur = con.cursor()
-        row = cur.execute("SELECT 1 FROM blacklist WHERE user_id=?", (user_id,)).fetchone()
+    with DB_ENGINE.connect() as conn:
+        row = conn.execute(text("SELECT 1 FROM blacklist WHERE user_id=:user_id"), {"user_id": user_id}).fetchone()
         return row is not None
 
 # -------------------------
-# ⏱️ Background: handle scheduled archives
+# ⏱️ Background: handle scheduled archives (NO CHANGE)
 # -------------------------
 @tasks.loop(seconds=30.0)
 async def archive_watcher():
@@ -273,7 +271,7 @@ async def before_archive_watcher():
     await bot.wait_until_ready()
 
 # -------------------------
-# 🚀 Events
+# 🚀 Events (NO CHANGE to logic, db_init/load_state are refactored)
 # -------------------------
 @bot.event
 async def on_ready():
@@ -320,11 +318,9 @@ async def unregister(ctx, member: discord.Member = None):
     """
     target = member or ctx.author
 
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE user_id = ?", (target.id,))
-    exists = c.fetchone()
-    conn.close()
+    # Check existence
+    with DB_ENGINE.connect() as conn:
+        exists = conn.execute(text("SELECT 1 FROM users WHERE user_id = :user_id"), {"user_id": target.id}).fetchone()
 
     if not exists:
         if target == ctx.author:
@@ -337,20 +333,19 @@ async def unregister(ctx, member: discord.Member = None):
         await ctx.send("❌ You don’t have permission to unregister other users.")
         return
 
+    # Clear local state
     user_links.pop(target.id, None)
     already_picked.discard(target.id)
     always_pick.discard(target.id)
     user_stats.pop(target.id, None)
 
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM users WHERE user_id = ?", (target.id,))
-    c.execute("DELETE FROM stats WHERE user_id = ?", (target.id,))
-    c.execute("DELETE FROM always_pick WHERE user_id = ?", (target.id,))
-    c.execute("DELETE FROM raffle_winners WHERE user_id = ?", (target.id,))
-    c.execute("DELETE FROM picks_state WHERE user_id = ?", (target.id,))
-    conn.commit()
-    conn.close()
+    # Clear database records
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM users WHERE user_id = :user_id"), {"user_id": target.id})
+        conn.execute(text("DELETE FROM stats WHERE user_id = :user_id"), {"user_id": target.id})
+        conn.execute(text("DELETE FROM always_pick WHERE user_id = :user_id"), {"user_id": target.id})
+        conn.execute(text("DELETE FROM raffle_winners WHERE user_id = :user_id"), {"user_id": target.id})
+        conn.execute(text("DELETE FROM picks_state WHERE user_id = :user_id"), {"user_id": target.id})
 
     if target == ctx.author:
         await ctx.send(f"✅ {ctx.author.mention}, you have been unregistered successfully.")
@@ -368,10 +363,8 @@ async def blacklist(ctx, member: discord.Member):
     except discord.HTTPException:
         pass
 
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO blacklist(user_id) VALUES(?)", (member.id,))
-        con.commit()
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("INSERT INTO blacklist(user_id) VALUES(:user_id) ON CONFLICT DO NOTHING"), {"user_id": member.id})
 
     await ctx.send(f"🚫 {member.mention} has been blacklisted.")
 
@@ -386,10 +379,8 @@ async def unblacklist(ctx, member: discord.Member):
     except discord.HTTPException:
         pass
 
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM blacklist WHERE user_id=?", (member.id,))
-        con.commit()
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM blacklist WHERE user_id=:user_id"), {"user_id": member.id})
 
     await ctx.send(f"✅ {member.mention} removed from blacklist.")
 
@@ -403,9 +394,9 @@ async def blacklist_list(ctx):
         pass
     except discord.HTTPException:
         pass
-    with db_conn() as con:
-        cur = con.cursor()
-        rows = cur.execute("SELECT user_id FROM blacklist").fetchall()
+        
+    with DB_ENGINE.connect() as conn:
+        rows = conn.execute(text("SELECT user_id FROM blacklist")).fetchall()
 
     if not rows:
         await ctx.send("✅ No users are currently blacklisted.")
@@ -459,7 +450,7 @@ async def list_users(ctx):
             color=discord.Color.green() if "Online" in title else discord.Color.red()
         )
         embed.set_footer(
-            text=f"Online: {online_count} | Offline: {offline_count} | Total: {len(user_links)}"
+            text=f"Online: {online_count} | Offline: {len(offline)} | Total: {len(user_links)}"
         )
         return embed
 
@@ -529,13 +520,12 @@ async def pick(ctx, raffle_name: str, number: int):
     random.shuffle(winners)
 
     raffles.setdefault(raffle_name, [])
-    with db_conn() as con:
-        cur = con.cursor()
-        cur.execute("INSERT OR IGNORE INTO raffles(raffle_name) VALUES(?)", (raffle_name,))
-        con.commit()
+    # Create raffle entry in DB
+    db_create_raffle(raffle_name)
 
     winner_role = discord.utils.get(ctx.guild.roles, name=WINNER_ROLE_NAME)
     if not winner_role:
+        # NOTE: Bot must have permission to create/manage roles
         winner_role = await ctx.guild.create_role(name=WINNER_ROLE_NAME)
 
     table = "```\nS/N | Discord Name          | X Username\n" + "-" * 40 + "\n"
@@ -549,6 +539,7 @@ async def pick(ctx, raffle_name: str, number: int):
         user_stats.setdefault(w.id, {"registrations": 0, "wins": 0})
         user_stats[w.id]["wins"] += 1
 
+        # NOTE: Bot must have permission to manage roles (above the member's highest role)
         await w.add_roles(winner_role)
 
         x_link = user_links.get(w.id, "")
@@ -586,9 +577,8 @@ async def status(ctx):
     online = [uid for uid in user_links if (m := ctx.guild.get_member(uid)) and m.status != discord.Status.offline]
     offline = [uid for uid in user_links if uid not in online]
 
-    with db_conn() as con:
-        cur = con.cursor()
-        total_blacklisted = cur.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
+    with DB_ENGINE.connect() as conn:
+        total_blacklisted = conn.execute(text("SELECT COUNT(*) FROM blacklist")).fetchone()[0]
 
     embed = discord.Embed(title="📊 Bot Status", color=discord.Color.green())
     embed.add_field(name="📝 Registered", value=total)
@@ -599,7 +589,7 @@ async def status(ctx):
     await ctx.send(embed=embed, reference=ctx.message, mention_author=True)
 
 # -------------------------
-# 🆕 Profile Command (+ Show Wins button)
+# 🆕 Profile Command (+ Show Wins button) (NO LOGIC CHANGE - uses refactored db_user_wins)
 # -------------------------
 class ShowWinsView(View):
     def __init__(self, user_id: int):
@@ -678,7 +668,7 @@ async def profile(ctx, member: discord.Member = None):
     await ctx.send(embed=embed, view=view, reference=ctx.message, mention_author=True)
 
 # -------------------------
-# 🎯 Always-pick (UNCHANGED commands; now persisted)
+# 🎯 Always-pick (NO LOGIC CHANGE - uses refactored db_set_always)
 # -------------------------
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -704,7 +694,7 @@ async def always_list(ctx):
     await ctx.send("👑 Always-pick list:\n" + ", ".join(members))
 
 # -------------------------
-# 📤 Export helpers
+# 📤 Export helpers (NO LOGIC CHANGE - uses refactored db_conn/db_user_wins implicitly)
 # -------------------------
 def build_rows_for_raffle(guild: discord.Guild, raffle_name: str):
     rows = [["S/N", "Discord Name", "X Username", "X Link"]]
@@ -712,11 +702,11 @@ def build_rows_for_raffle(guild: discord.Guild, raffle_name: str):
     if raffle_name in raffles:
         winners = raffles.get(raffle_name, [])
     else:
-        with db_conn() as con:
-            cur = con.cursor()
-            winners = [r[0] for r in cur.execute(
-                "SELECT user_id FROM raffle_winners WHERE raffle_name=? ORDER BY picked_at ASC", (raffle_name,)
-            )]
+        # Use DB_ENGINE.connect() for a specific select operation
+        with DB_ENGINE.connect() as conn:
+            winners = [r[0] for r in conn.execute(text(
+                "SELECT user_id FROM raffle_winners WHERE raffle_name=:name ORDER BY picked_at ASC"), {"name": raffle_name}
+            ).fetchall()]
 
     for sn, uid in enumerate(winners, start=1):
         member = guild.get_member(uid)
@@ -801,7 +791,7 @@ def export_png(guild: discord.Guild, raffle_name: str) -> str:
     return file_path
 
 # -------------------------
-# 📦 Export UI (with permissions + scheduled archive)
+# 📦 Export UI (NO LOGIC CHANGE - uses refactored helper fns)
 # -------------------------
 async def schedule_archive_in_5(raffle_name: str):
     when = datetime.utcnow() + timedelta(minutes=5)
@@ -834,9 +824,8 @@ class ExportButtons(View):
         if self.raffle_name in raffles:
             has_winners = len(raffles.get(self.raffle_name, [])) > 0
         else:
-            with db_conn() as con:
-                cur = con.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM raffle_winners WHERE raffle_name=?", (self.raffle_name,)).fetchone()
+            with DB_ENGINE.connect() as conn:
+                row = conn.execute(text("SELECT COUNT(*) FROM raffle_winners WHERE raffle_name=:name"), {"name": self.raffle_name}).fetchone()
                 has_winners = row and row[0] > 0
 
         if not has_winners:
@@ -879,9 +868,8 @@ class RaffleSelect(Select):
             winners = raffles.get(raffle_name, [])
             has_any = bool(winners)
         else:
-            with db_conn() as con:
-                cur = con.cursor()
-                row = cur.execute("SELECT COUNT(*) FROM raffle_winners WHERE raffle_name=?", (raffle_name,)).fetchone()
+            with DB_ENGINE.connect() as conn:
+                row = conn.execute(text("SELECT COUNT(*) FROM raffle_winners WHERE raffle_name=:name"), {"name": raffle_name}).fetchone()
                 has_any = row and row[0] > 0
 
         if not has_any:
@@ -906,7 +894,7 @@ class RaffleDropdown(View):
         self.add_item(RaffleSelect(opts, archived=archived))
 
 # -------------------------
-# 📤 Commands: Export & Archive
+# 📤 Commands: Export & Archive (NO CHANGE - use refactored helper fns)
 # -------------------------
 @bot.command()
 async def export(ctx):
@@ -941,17 +929,21 @@ async def list_archived(ctx):
         color=discord.Color.blurple()
     )
     await ctx.send(embed=embed, view=RaffleDropdown(archived=True))
+
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def reset_db(ctx):
     """⚠️ Clears all tables in the database."""
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM users")
-    c.execute("DELETE FROM raffles")
-    c.execute("DELETE FROM stats")
-    conn.commit()
-    conn.close()
+    # Delete from DB
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM users"))
+        conn.execute(text("DELETE FROM raffles"))
+        conn.execute(text("DELETE FROM stats"))
+        conn.execute(text("DELETE FROM always_pick"))
+        conn.execute(text("DELETE FROM raffle_winners"))
+        conn.execute(text("DELETE FROM picks_state"))
+        conn.execute(text("DELETE FROM archive_schedule"))
+        conn.execute(text("DELETE FROM blacklist"))
 
     global user_links, raffles, user_stats, already_picked, always_pick
     user_links.clear()
@@ -966,12 +958,13 @@ async def reset_db(ctx):
 @commands.has_permissions(administrator=True)
 async def reset_raffles(ctx):
     """⚠️ Clears raffles and stats, but keeps registered users."""
-    conn = db_conn()
-    c = conn.cursor()
-    c.execute("DELETE FROM raffles")
-    c.execute("DELETE FROM stats")
-    conn.commit()
-    conn.close()
+    # Delete from DB
+    with DB_ENGINE.begin() as conn:
+        conn.execute(text("DELETE FROM raffles"))
+        conn.execute(text("DELETE FROM stats"))
+        conn.execute(text("DELETE FROM raffle_winners"))
+        conn.execute(text("DELETE FROM picks_state"))
+        conn.execute(text("DELETE FROM archive_schedule"))
 
     global raffles, user_stats, already_picked
     raffles.clear()
@@ -979,7 +972,36 @@ async def reset_raffles(ctx):
     already_picked.clear()
 
     await ctx.send("✅ Raffles and stats have been reset. Registered users remain.")
-keep_alive()
+
+# -------------------------
+# 🌐 Web Server for Keep-Alive (FREE TIER ONLY)
+# -------------------------
+from flask import Flask
+from threading import Thread
+
+# Create the Flask app
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    """A simple endpoint for the external pinger to hit."""
+    return "Bot is alive and running!"
+
+def run_flask_server():
+    """Start Flask in a separate thread."""
+    # Note: We must use 0.0.0.0 and the port specified by Render (usually 8080 or the PORT env var)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# -------------------------
+# ▶️ Run Bot (UPDATED)
+# -------------------------
+
+# 1. Start the Flask server in a background thread
+t = Thread(target=run_flask_server)
+t.start()
+
+# 2. Start the Discord bot in the main thread
 bot.run(TOKEN)
 # -------------------------
 # ▶️ Run Bot
