@@ -26,7 +26,7 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-# -------------------------
+# -------------------------\r
 # 🔑 Tokens & Logo
 # -------------------------
 # 🚨 SECURITY FIX: Using environment variable for token
@@ -57,13 +57,23 @@ WINNER_ROLE_NAME = "Winner"
 # ---------------------------------------------
 # 🗃️ Database helpers (PostgreSQL Engine)
 # ---------------------------------------------
-# Load the database URL from the environment variable (set on Render)
-DATABASE_URL = os.getenv('DATABASE_URL')
+# --- START: Updated DB Engine Initialization ---
+# Load all database components separately
+DB_USER = os.getenv('DB_USER')
+DB_PASS = os.getenv('DB_PASS')
+DB_HOST = os.getenv('DB_HOST')
+DB_PORT = os.getenv('DB_PORT')
+DB_NAME = os.getenv('DB_NAME')
+
+# We now build the URL from clean components, avoiding parsing errors
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
 DB_ENGINE = create_engine(
     DATABASE_URL,
     # Use StaticPool for non-asyncio database connections in an async environment
     poolclass=StaticPool, 
 )
+# --- END: Updated DB Engine Initialization ---
 
 # REMOVED: def db_conn(): return sqlite3.connect(DB_PATH)
 
@@ -872,7 +882,7 @@ class RaffleSelect(Select):
                 has_any = row and row[0] > 0
 
         if not has_any:
-            await interaction.response.send_message(f"⚠️ No winners in **{raffle_name}**.", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ No winners found in **{raffle_name}**.", ephemeral=True)
             return
 
         view = ExportButtons(raffle_name, interaction.guild, archived=self.archived)
@@ -972,7 +982,7 @@ async def reset_raffles(ctx):
 
     await ctx.send("✅ Raffles and stats have been reset. Registered users remain.")
 
-# -------------------------
+# -------------------------\r
 # 🌐 Web Server for Keep-Alive (FREE TIER ONLY)
 # -------------------------
 from flask import Flask
@@ -992,7 +1002,7 @@ def run_flask_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# -------------------------
+# -------------------------\r
 # ▶️ Run Bot (UPDATED)
 # -------------------------
 
@@ -1001,8 +1011,4 @@ t = Thread(target=run_flask_server)
 t.start()
 
 # 2. Start the Discord bot in the main thread
-bot.run(TOKEN)
-# -------------------------
-# ▶️ Run Bot
-# -------------------------
 bot.run(TOKEN)
