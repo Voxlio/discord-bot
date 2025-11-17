@@ -1,7 +1,6 @@
 import os
 import re
 import random
-# import sqlite3  <-- REMOVED
 import asyncio
 from datetime import datetime, timedelta
 import discord
@@ -26,7 +25,7 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-# -------------------------\r
+# -------------------------
 # 🔑 Tokens & Logo
 # -------------------------
 # 🚨 SECURITY FIX: Using environment variable for token
@@ -52,8 +51,6 @@ already_picked = set()
 always_pick = set()
 WINNER_ROLE_NAME = "Winner"
 
-# REMOVED: DB_PATH = "voxpicker.db"
-
 # ---------------------------------------------
 # 🗃️ Database helpers (PostgreSQL Engine)
 # ---------------------------------------------
@@ -74,8 +71,6 @@ DB_ENGINE = create_engine(
     poolclass=StaticPool, 
 )
 # --- END: Updated DB Engine Initialization ---
-
-# REMOVED: def db_conn(): return sqlite3.connect(DB_PATH)
 
 def db_init():
     # Use DB_ENGINE.begin() for transactional operations (CREATE TABLE)
@@ -162,7 +157,7 @@ def load_state_from_db():
         for (uid,) in conn.execute(text("SELECT user_id FROM picks_state")).fetchall():
             already_picked.add(uid)
 
-def db_upsert_user(user_id: int, link: str):
+def db_upsert_user(user_id: int, link: str = ""): # Added optional link parameter for convenience
     # Use DB_ENGINE.begin() for transactional operations (INSERT/UPDATE)
     with DB_ENGINE.begin() as conn:
         conn.execute(text("""
@@ -176,6 +171,11 @@ def db_upsert_user(user_id: int, link: str):
         """), {"user_id": user_id})
 
 def db_update_stat(user_id: int, delta_reg: int = 0, delta_wins: int = 0):
+    # --- FIX START: Ensure user exists in 'users' table before updating 'stats' ---
+    # This prevents the Foreign Key Violation error
+    db_upsert_user(user_id) 
+    # --- FIX END ---
+    
     with DB_ENGINE.begin() as conn:
         conn.execute(text("""
         INSERT INTO stats(user_id, registrations, wins) VALUES(:user_id, :reg_val, :wins_val)
@@ -263,7 +263,7 @@ def is_blacklisted(user_id: int) -> bool:
         return row is not None
 
 # -------------------------
-# ⏱️ Background: handle scheduled archives (NO CHANGE)
+# ⏱️ Background: handle scheduled archives
 # -------------------------
 @tasks.loop(seconds=30.0)
 async def archive_watcher():
@@ -280,7 +280,7 @@ async def before_archive_watcher():
     await bot.wait_until_ready()
 
 # -------------------------
-# 🚀 Events (NO CHANGE to logic, db_init/load_state are refactored)
+# 🚀 Events
 # -------------------------
 @bot.event
 async def on_ready():
@@ -543,7 +543,10 @@ async def pick(ctx, raffle_name: str, number: int):
         raffles[raffle_name].append(w.id)
         db_add_winner(raffle_name, w.id)
         db_set_picked(w.id)
-        db_update_stat(w.id, delta_wins=1)
+        
+        # This call now correctly handles users who might have been registered 
+        # but did not have a stats record yet (which caused the error).
+        db_update_stat(w.id, delta_wins=1) 
 
         user_stats.setdefault(w.id, {"registrations": 0, "wins": 0})
         user_stats[w.id]["wins"] += 1
@@ -598,7 +601,7 @@ async def status(ctx):
     await ctx.send(embed=embed, reference=ctx.message, mention_author=True)
 
 # -------------------------
-# 🆕 Profile Command (+ Show Wins button) (NO LOGIC CHANGE - uses refactored db_user_wins)
+# 🆕 Profile Command (+ Show Wins button)
 # -------------------------
 class ShowWinsView(View):
     def __init__(self, user_id: int):
@@ -677,7 +680,7 @@ async def profile(ctx, member: discord.Member = None):
     await ctx.send(embed=embed, view=view, reference=ctx.message, mention_author=True)
 
 # -------------------------
-# 🎯 Always-pick (NO LOGIC CHANGE - uses refactored db_set_always)
+# 🎯 Always-pick
 # -------------------------
 @bot.command()
 @commands.has_permissions(administrator=True)
@@ -703,7 +706,7 @@ async def always_list(ctx):
     await ctx.send("👑 Always-pick list:\n" + ", ".join(members))
 
 # -------------------------
-# 📤 Export helpers (NO LOGIC CHANGE - uses refactored db_conn/db_user_wins implicitly)
+# 📤 Export helpers
 # -------------------------
 def build_rows_for_raffle(guild: discord.Guild, raffle_name: str):
     rows = [["S/N", "Discord Name", "X Username", "X Link"]]
@@ -800,7 +803,7 @@ def export_png(guild: discord.Guild, raffle_name: str) -> str:
     return file_path
 
 # -------------------------
-# 📦 Export UI (NO LOGIC CHANGE - uses refactored helper fns)
+# 📦 Export UI
 # -------------------------
 async def schedule_archive_in_5(raffle_name: str):
     when = datetime.utcnow() + timedelta(minutes=5)
@@ -903,7 +906,7 @@ class RaffleDropdown(View):
         self.add_item(RaffleSelect(opts, archived=archived))
 
 # -------------------------
-# 📤 Commands: Export & Archive (NO CHANGE - use refactored helper fns)
+# 📤 Commands: Export & Archive
 # -------------------------
 @bot.command()
 async def export(ctx):
@@ -982,7 +985,7 @@ async def reset_raffles(ctx):
 
     await ctx.send("✅ Raffles and stats have been reset. Registered users remain.")
 
-# -------------------------\r
+# -------------------------
 # 🌐 Web Server for Keep-Alive (FREE TIER ONLY)
 # -------------------------
 from flask import Flask
@@ -1002,7 +1005,7 @@ def run_flask_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# -------------------------\r
+# -------------------------
 # ▶️ Run Bot (UPDATED)
 # -------------------------
 
